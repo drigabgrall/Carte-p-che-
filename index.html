@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spots de pêche – Poisson + Verrouillage</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    :root { --bg:#0b1220; --panel:#10192b; --muted:#7d8fb3; --text:#e6edf7; --border:#22304a; --accent:#36b37e; }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto}
+    #app{display:grid;grid-template-columns:320px 1fr;height:100%}
+    #sidebar{background:#10192b;border-right:1px solid var(--border);display:flex;flex-direction:column}
+    header{padding:14px 16px;border-bottom:1px solid var(--border)}
+    #controls{padding:12px;display:grid;gap:8px}
+    .btn{background:#162339;color:var(--text);border:1px solid var(--border);padding:10px 12px;border-radius:12px;cursor:pointer;font-weight:600}
+    .btn.primary{background:#153a2d;border-color:#1f5f49}
+    .btn.danger{background:#3a1620;border-color:#5f1f31}
+    .btn.secondary{background:#202d49;border-color:#22304a}
+    #map{height:100%;width:100%;position:relative}
+    .fab{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);z-index:1000;background:#153a2d;border:2px solid #1f5f49;color:#e6edf7;padding:12px 16px;border-radius:999px;font-weight:700;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+    .leaflet-control-container{z-index:1001}
+    .item{border:1px solid var(--border);border-radius:12px;background:#0f1a2c;padding:10px;margin:8px}
+    .meta{font-size:12px;color:var(--muted)}
+    @media (max-width:900px){#app{grid-template-columns:1fr;grid-template-rows:45% 55%}#sidebar{order:2}#map{order:1}}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <header>
+        <h1>Spots de pêche</h1>
+        <p>Ajoutez vos spots. Appui long sur la carte pour créer un spot, ou utilisez le bouton “Ajouter ici”.</p>
+      </header>
+      <div id="controls">
+        <button id="addBtn" class="btn primary">➕ Mode “cliquer sur la carte”</button>
+      </div>
+      <div class="item">
+        <strong>Météo (centre de la carte)</strong>
+        <div class="meta" id="mapCenterWeatherMeta">—</div>
+        <div class="meta" id="mapCenterWeatherBody">Chargement…</div>
+      </div>
+    </aside>
+    <div id="map">
+      <button id="addHereBtn" class="fab">➕ Ajouter ici (au centre)</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // Base
+    const STORAGE_KEY='spots-peche:v4-poisson-lock';
+    let addingMode=false;
+    let spots=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]');
+    const markers=new Map();
+    const map=L.map('map').setView([46.5,-2],7);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(map);
+
+    // Helpers
+    const uid=()=>Math.random().toString(36).slice(2,9);
+    const save=()=>localStorage.setItem(STORAGE_KEY,JSON.stringify(spots));
+    const color=cat=>({Bar:'#4caf50',Loup:'#ff9800',Daurade:'#03a9f4'})[cat]||'#9e9e9e';
+
+    function fishIcon(cat, locked=false){
+      const c=color(cat);
+      const opacity = locked ? 0.6 : 1;
+      const lockHtml = locked ? '<div style="position:absolute;right:-2px;top:-2px;font-size:12px">🔒</div>' : '';
+      const svg = `<svg width="24" height="24" viewBox="0 0 24 24" style="display:block;filter:drop-shadow(0 0 2px rgba(0,0,0,.4));opacity:${opacity}">
+        <g fill="${c}">
+          <circle cx="8" cy="12" r="4"></circle>
+          <polygon points="12,12 20,6 20,18"></polygon>
+        </g>
+        <circle cx="7" cy="11" r="1" fill="#fff"></circle>
+      </svg>`;
+      return L.divIcon({className:'fish-pin',html:`<div style="position:relative">${svg}${lockHtml}</div>`,iconSize:[24,24],iconAnchor:[12,12]});
+    }
+
+    const d2c=d=>['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSO','SO','OSO','O','ONO','NO','NNO'][Math.round(d/22.5)%16]||'—';
+    const j=async u=>{const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json();}
+    const wx=async (lat,lng)=>{
+      const a=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation&timezone=auto`;
+      const b=`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lng}&current=wave_height,wind_wave_period,wind_wave_direction&timezone=auto`;
+      const [m,mar]=await Promise.allSettled([j(a),j(b)]);
+      return {c:m.value?.current,mar:mar.value?.current};
+    };
+    const wxHTML=w=>!w||!w.c?'<em>Indispo</em>':`🌡️ ${Math.round(w.c.temperature_2m)}°C · 💨 ${Math.round(w.c.wind_speed_10m)} m/s dir ${d2c(w.c.wind_direction_10m)}${w.mar?` · 🌊 ${w.mar.wave_height?.toFixed?.(1)||'—'} m / ${Math.round(w.mar.wind_wave_period||0)} s`:''}`;
+
+    // UI refs
+    const addBtn=document.getElementById('addBtn');
+    const addHereBtn=document.getElementById('addHereBtn');
+    const meta=document.getElementById('mapCenterWeatherMeta');
+    const body=document.getElementById('mapCenterWeatherBody');
+
+    // Weather for map center
+    function refreshCenterWx(){
+      const c=map.getCenter();
+      meta.textContent=`${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}`;
+      body.textContent='Chargement…';
+      wx(c.lat,c.lng).then(w=>body.innerHTML=wxHTML(w)).catch(()=>body.textContent='Erreur météo');
+    }
+    map.on('moveend',refreshCenterWx); refreshCenterWx();
+
+    // Create marker + popup with lock controls
+    function bindMarker(s){
+      const marker=markers.get(s.id)||L.marker([s.lat,s.lng],{draggable:!s.locked,icon:fishIcon(s.cat,s.locked)}).addTo(map);
+      markers.set(s.id, marker);
+
+      marker.on('dragend',ev=>{
+        if (s.locked) { marker.setLatLng([s.lat,s.lng]); return; }
+        const p=ev.target.getLatLng(); s.lat=p.lat; s.lng=p.lng; save();
+      });
+
+      function openForm(isNew=false){
+        const html=`<form class="popup-form" style="display:grid;gap:8px;min-width:260px">
+          <div class="meta">Statut: ${s.locked?'<strong>🔒 Verrouillé</strong>':'<strong>Déverrouillé</strong>'}</div>
+          <div style="display:flex;gap:8px">
+            <button type="button" data-lock class="btn secondary">${s.locked?'Déverrouiller':'Verrouiller'}</button>
+            ${!s.locked?'<button type="button" data-del class="btn danger">Supprimer</button>':''}
+          </div>
+          <label>Nom <input name="name" value="${s.name||''}" ${s.locked?'disabled':''} required></label>
+          <label>Espèce <select name="cat" ${s.locked?'disabled':''}>
+            <option ${s.cat==='Bar'?'selected':''}>Bar</option>
+            <option ${s.cat==='Loup'?'selected':''}>Loup</option>
+            <option ${s.cat==='Daurade'?'selected':''}>Daurade</option>
+            <option ${s.cat==='Autre'?'selected':''}>Autre</option>
+          </select></label>
+          <label>Note (1-5) <input type="number" min="1" max="5" name="note" value="${s.note||3}" ${s.locked?'disabled':''}></label>
+          <label>Description <textarea name="desc" rows="3" ${s.locked?'disabled':''}>${s.desc||''}</textarea></label>
+          ${!s.locked?'<button class="btn primary" type="submit">Enregistrer</button>': ''}
+          <div class="item"><div class="meta">Météo</div><div class="meta" id="wx-'+s.id+'">Chargement…</div></div>
+        </form>`;
+        marker.bindPopup(html).openPopup();
+        marker.dragging[s.locked?'disable':'enable']();
+
+        marker.once('popupopen',()=>{
+          const el=marker.getPopup().getElement();
+          const lockBtn=el.querySelector('[data-lock]');
+          const delBtn=el.querySelector('[data-del]');
+          const form=el.querySelector('form');
+
+          // Weather
+          const out=el.querySelector('#wx-'+s.id);
+          wx(s.lat,s.lng).then(w=>{ if(out) out.innerHTML=wxHTML(w); }).catch(()=>{ if(out) out.textContent='Erreur météo'; });
+
+          if(lockBtn){
+            lockBtn.addEventListener('click',()=>{
+              s.locked=!s.locked;
+              marker.setIcon(fishIcon(s.cat,s.locked));
+              marker.dragging[s.locked?'disable':'enable']();
+              save();
+              openForm(false); // re-render popup with new state
+            });
+          }
+          if(delBtn){
+            delBtn.addEventListener('click',()=>{
+              if(!confirm('Supprimer ce spot ?')) return;
+              const i=spots.findIndex(x=>x.id===s.id);
+              if(i>-1) spots.splice(i,1);
+              save();
+              map.removeLayer(marker); markers.delete(s.id);
+            });
+          }
+          if(form){
+            form.addEventListener('submit',e=>{
+              e.preventDefault();
+              const data=new FormData(form);
+              s.name=data.get('name');
+              s.cat=data.get('cat');
+              s.note=Number(data.get('note'))||3;
+              s.desc=data.get('desc');
+              marker.setIcon(fishIcon(s.cat,s.locked));
+              save(); marker.closePopup();
+            });
+          }
+        });
+      }
+      marker.on('click',()=>openForm(false));
+      return {marker, openForm};
+    }
+
+    // Add helpers
+    function createSpotAt(lat,lng){
+      const s={id:uid(),name:'',cat:'Bar',note:3,desc:'',lat,lng,locked:false};
+      spots.push(s); save();
+      const {openForm}=bindMarker(s);
+      openForm(true);
+    }
+
+    // Controls
+    const addBtn=document.getElementById('addBtn');
+    addBtn.addEventListener('click',()=>{
+      addingMode=!addingMode;
+      addBtn.textContent = addingMode ? '🖱️ Cliquez sur la carte (mode actif)' : '➕ Mode “cliquer sur la carte”';
+      addBtn.classList.toggle('primary', addingMode);
+    });
+    map.on('click',e=>{ if(addingMode) { addingMode=false; addBtn.textContent='➕ Mode “cliquer sur la carte”'; addBtn.classList.remove('primary'); createSpotAt(e.latlng.lat,e.latlng.lng); } });
+    map.on('contextmenu',e=>{ createSpotAt(e.latlng.lat,e.latlng.lng); });
+    document.getElementById('addHereBtn').addEventListener('click',()=>{ const c=map.getCenter(); createSpotAt(c.lat,c.lng); });
+
+    // Restore existing markers
+    spots.forEach(s=> bindMarker(s));
+
+    // Geo start
+    if(navigator.geolocation){
+      navigator.geolocation.getCurrentPosition(p=>map.setView([p.coords.latitude,p.coords.longitude],12),()=>{}, {enableHighAccuracy:true,timeout:2000});
+    }
+  </script>
+</body>
+</html>
